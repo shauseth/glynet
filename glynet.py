@@ -15,6 +15,21 @@ import numpy as np
 import matplotlib.pyplot as plt
 
 
+# Architecture
+
+class GlyNet(nn.Module):
+    def __init__(self, n_hidden):
+        super(GlyNet, self).__init__()
+        self.fc1 = nn.Linear(1040, n_hidden)
+        self.fc2 = nn.Linear(n_hidden, n_hidden)
+        self.fc3 = nn.Linear(n_hidden, 50)
+    def forward(self, x):
+        x = F.relu(self.fc1(x))
+        x = F.relu(self.fc2(x))
+        x = F.relu(self.fc3(x))
+        return x
+
+
 # Encoding
 
 monomers = ['Fuc', 'GalNAc', 'Gal', 'GlcNAc', 'GlcA', 'Glc', 'KDN',
@@ -96,7 +111,8 @@ def ten_fold(traindata):
 
 def get_data(transformation = np.cbrt, cutoff = 1.0, path = 'data/', stdev = False):
     """Get CBP data from CSVs in path."""
-    cbps = [cbp for cbp in os.listdir(path) if not cbp.endswith('.csv') and cbp != '.DS_Store']
+    cbps = [cbp.split('.')[0] for cbp in os.listdir(path) if cbp.endswith('.csv')
+            and not cbp.endswith('_stdev.csv') and cbp != '.DS_Store']
     data = pd.DataFrame()
     for i, cbp in enumerate(sorted(cbps)):
         cbp_data = pd.read_csv(path + cbp + '_stdev.csv') if stdev else pd.read_csv(path + cbp + '.csv')
@@ -150,7 +166,7 @@ def make_results(data, actual, predicted, glycans, experiment, path, proteins, s
     results = pd.DataFrame()
     results['glycans'] = glycans
     actual_tensor = torch.tensor(actual).float()
-    predicted_tensor = torch.tensor(predicted) # .unsqueeze(1) # here
+    predicted_tensor = torch.tensor(predicted)
     for i in range(len(proteins)):
         results[proteins[i] + ' actual'] = actual_tensor[:, i]
         results[proteins[i] + ' predicted'] = predicted_tensor[:, i]
@@ -161,6 +177,47 @@ def make_results(data, actual, predicted, glycans, experiment, path, proteins, s
     if save:
         results.to_csv(path + experiment + '.csv', index = False)
     return results
+
+
+# Training
+
+def train(data, proteins, epochs, lr, batch_size, n_hidden):
+    """Perform ten-fold cross validation on the data."""
+    traindata = list(zip(data['IUPAC'], data[proteins].values.tolist()))
+    glycans, actual, predicted = [], [], []
+    for i, (held_out, kept_in) in enumerate(ten_fold(traindata)):
+        train_losses, test_losses, r2s = [], [], []
+        trainloader = prepare_data(kept_in, mode = 'train')
+        print('fold', i + 1, 'held out')
+        net = GlyNet(n_hidden)
+        criterion = nn.MSELoss()
+        optimizer = optim.SGD(net.parameters(), lr = lr)
+        for epoch in range(epochs):
+            train_loss = 0.0
+            for inputs, values in trainloader:
+                optimizer.zero_grad()
+                outputs = net(inputs)
+                loss = criterion(values, outputs)
+                loss.backward()
+                optimizer.step()
+                train_loss += loss.item()
+            test_inputs, test_values = prepare_data(held_out, mode = 'test')
+            with torch.no_grad():
+                test_outputs = net(test_inputs)
+                test_loss = criterion(test_values, test_outputs).item()
+                r2 = r2_score(test_values, test_outputs)
+            train_losses.append(train_loss / (600 / batch_size))
+            test_losses.append(test_loss)
+            r2s.append(r2)
+        actual += [actual for glycans, actual in held_out]
+        predicted += test_outputs.squeeze(1).tolist()
+        glycans += [glycans for glycans, actual in held_out]
+        print('train_loss:', round(train_loss / (600 / batch_size), 4))
+        print('test_loss:', round(test_loss, 4))
+        print('r-squared:', round(r2, 4))
+        plot_performance(train_losses, test_losses, r2s)
+    print('finished training.', '\n')
+    return actual, predicted, glycans
 
 
 # Visuals
@@ -209,6 +266,16 @@ def plot_results(actual, predicted, title = 'title', color = 'cornflowerblue', f
     plt.ylim(0)
     plt.legend()
     plt.savefig(filename, bbox_inches = 'tight') if filename else plt.show()
+    
+def plot_scatter(proteins, results, experiment):
+    """Make the scatter plots for the results."""
+    for protein in proteins:
+        results = results.sort_values(protein + ' actual')
+        actual = results[protein + ' actual'].values
+        predicted = results[protein + ' predicted'].values
+        title = protein + '_' + experiment
+        color = color_dict[protein]
+        plot_results(actual, predicted, title, color)
 
 
 # Other
