@@ -14,20 +14,24 @@ import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 # Architecture
-
+    
 class GlyNet(nn.Module):
-    def __init__(self, n_hidden):
+    def __init__(self, hidden):
         super(GlyNet, self).__init__()
-        self.fc1 = nn.Linear(1040, n_hidden)
-        self.fc2 = nn.Linear(n_hidden, n_hidden)
-        self.fc3 = nn.Linear(n_hidden, 50)
+        self.layers = nn.ModuleList()
+        current_dim = 1040
+        for hidden_dim in hidden:
+            self.layers.append(nn.Linear(current_dim, hidden_dim))
+            current_dim = hidden_dim
+        self.layers.append(nn.Linear(current_dim, 50))
     def forward(self, x):
-        x = F.relu(self.fc1(x))
-        x = F.relu(self.fc2(x))
-        x = F.relu(self.fc3(x))
-        return x
+        for layer in self.layers[:-1]:
+            x = F.relu(layer(x))
+        out = torch.sigmoid(self.layers[-1](x))
+        return out
 
 
 # Encoding
@@ -108,6 +112,22 @@ def ten_fold(traindata):
             held_out += sample
         kept_in = [pair for pair in traindata if not pair in held_out]
         yield held_out, kept_in
+        
+def transform(data, transformation, cutoff):
+    """Transform average RFUs with some cutoff."""
+    proteins = list(data.columns[1:])
+    values = data[proteins].values
+    values[values <= cutoff] = cutoff
+    values = transformation(values)
+    data[proteins] = values
+    return data
+
+def normalize(data):
+    """Normalize each column of the dataset."""
+    proteins = list(data.columns[1:])
+    for protein in proteins:
+        data[protein] = norm(data[protein])
+    return data
 
 def get_data(transformation = np.cbrt, cutoff = 1.0, path = 'data/', stdev = False):
     """Get CBP data from CSVs in path."""
@@ -127,40 +147,26 @@ def get_data(transformation = np.cbrt, cutoff = 1.0, path = 'data/', stdev = Fal
     data = data.dropna()
     del data['Index']
     data = transform(data, transformation, cutoff)
+    data = normalize(data)
     return data
-
-def transform(data, transformation, cutoff):
-    """Transform average RFUs with some cutoff."""
-    proteins = list(data.columns[1:])
-    values = data[proteins].values
-    values[values <= cutoff] = cutoff
-    values = transformation(values)
-    data[proteins] = values
-    return data
-
-def detransform(results, transformation = np.cbrt):
-    """Remove the transformation from the results."""
-    values = results[results.columns[1:]].values
-    results[results.columns[1:]] = np.power(values, 3) if transformation == np.cbrt else None
-    return results
 
 def prepare_data(data, mode = 'train', batch_size = 16):
     """Prepares inputs and outputs for training or testing."""
     inputs, values = [], []
     for glycan, value in data:
-        glycan_tensor = pad(encode(glycan)).view(-1)
-        value_tensor = torch.tensor(value).float()
+        glycan_tensor = pad(encode(glycan)).view(-1).to(device)
+        value_tensor = torch.tensor(value).float().to(device)
         inputs.append(glycan_tensor)
         values.append(value_tensor)
     if mode == 'train':
         trainset = list(zip(inputs, values))
         return torch.utils.data.DataLoader(trainset, batch_size = batch_size)
     elif mode == 'test':
-        inputs_stack = torch.stack(inputs)
-        values_stack = torch.stack(values).float()
+        inputs_stack = torch.stack(inputs).to(device)
+        values_stack = torch.stack(values).float().to(device)
         return inputs_stack, values_stack
     
-def make_results(data, actual, predicted, glycans, experiment, path, proteins, save = True):
+def make_results(data, actual, predicted, glycans, proteins, filename = None):
     """Makes the results CSV in path with experiment name."""
     data = data.sort_index()
     results = pd.DataFrame()
@@ -173,15 +179,14 @@ def make_results(data, actual, predicted, glycans, experiment, path, proteins, s
     results['index'] = results['glycans'].map(dict(zip(data['IUPAC'], data.index)))
     results = results.sort_values('index')
     del results['index']
-    results = detransform(results)
-    if save:
-        results.to_csv(path + experiment + '.csv', index = False)
+    if filename:
+        results.to_csv(filename + '.csv', index = False)
     return results
 
 
 # Training
 
-def train(data, proteins, epochs, lr, batch_size, n_hidden):
+def train(data, proteins, epochs, lr, batch_size, n_hidden, n_layers):
     """Perform ten-fold cross validation on the data."""
     traindata = list(zip(data['IUPAC'], data[proteins].values.tolist()))
     glycans, actual, predicted = [], [], []
@@ -189,7 +194,8 @@ def train(data, proteins, epochs, lr, batch_size, n_hidden):
         train_losses, test_losses, r2s = [], [], []
         trainloader = prepare_data(kept_in, mode = 'train')
         print('fold', i + 1, 'held out')
-        net = GlyNet(n_hidden)
+        net = GlyNet([n_hidden] * n_layers)
+        net = net.to(device)
         criterion = nn.MSELoss()
         optimizer = optim.SGD(net.parameters(), lr = lr)
         for epoch in range(epochs):
@@ -205,7 +211,7 @@ def train(data, proteins, epochs, lr, batch_size, n_hidden):
             with torch.no_grad():
                 test_outputs = net(test_inputs)
                 test_loss = criterion(test_values, test_outputs).item()
-                r2 = r2_score(test_values, test_outputs)
+                r2 = r2_score(test_values.cpu(), test_outputs.cpu())
             train_losses.append(train_loss / (600 / batch_size))
             test_losses.append(test_loss)
             r2s.append(r2)
@@ -253,7 +259,7 @@ def plot_all(results, title, proteins, filename = None):
     plt.ylabel('R-squared')
     plt.ylim(0, 1)
     plt.grid(axis = 'y', alpha = 0.2)
-    plt.savefig(filename, bbox_inches = 'tight') if filename else plt.show()
+    plt.savefig(filename + '.pdf', bbox_inches = 'tight') if filename else plt.show()
 
 def plot_results(actual, predicted, title = 'title', color = 'cornflowerblue', filename = None):
     """Plots the predictions along with the actuals."""
